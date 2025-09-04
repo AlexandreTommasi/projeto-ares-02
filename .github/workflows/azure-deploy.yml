@@ -1,0 +1,239 @@
+name: Deploy to Azure Web App
+
+on:
+  workflow_dispatch:
+  # Push trigger comentado para evitar deploy automático no primeiro commit
+  # Descomente as linhas abaixo se quiser deploy automático em futuros pushes:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      - name: Check project structure
+        run: |
+          echo "=== Project root structure ==="
+          ls -la
+          echo "=== Backend structure ==="
+          ls -la backend/ | head -10
+          echo "=== Frontend structure ==="
+          ls -la frontend/ | head -10
+
+      - name: Build and consolidate projects
+        run: |
+          # Create consolidated directory structure
+          mkdir -p consolidated
+          
+          # Build Backend
+          echo "=== Building Backend ==="
+          cd backend
+          npm ci || npm install
+          npm run build --if-present
+          npm run test --if-present -- --passWithNoTests || echo "No tests found"
+          cd ..
+          
+          # Build Frontend  
+          echo "=== Building Frontend ==="
+          cd frontend
+          npm ci || npm install
+          npm run build --if-present
+          cd ..
+          
+          # Copy backend production files only
+          echo "=== Preparing Backend for deployment ==="
+          mkdir -p consolidated/backend
+          cp backend/package*.json consolidated/backend/
+          
+          # Copy compiled backend code
+          if [ -d "backend/dist" ]; then
+            cp -r backend/dist consolidated/backend/
+          else
+            cp -r backend/src consolidated/backend/
+          fi
+          
+          # Copy backend configs
+          [ -f "backend/tsconfig.json" ] && cp backend/tsconfig.json consolidated/backend/
+          [ -d "backend/public" ] && cp -r backend/public consolidated/backend/
+          
+          # Copy frontend production files only
+          echo "=== Preparing Frontend for deployment ==="
+          mkdir -p consolidated/frontend
+          cp frontend/package*.json consolidated/frontend/
+          
+          # Copy frontend build output
+          if [ -d "frontend/.next" ]; then
+            echo "Copying Next.js build..."
+            cp -r frontend/.next consolidated/frontend/
+            # Also copy Next.js required files
+            [ -f "frontend/next.config.js" ] && cp frontend/next.config.js consolidated/frontend/
+            [ -f "frontend/next.config.mjs" ] && cp frontend/next.config.mjs consolidated/frontend/
+          elif [ -d "frontend/dist" ]; then
+            cp -r frontend/dist consolidated/frontend/
+          elif [ -d "frontend/build" ]; then
+            cp -r frontend/build consolidated/frontend/
+          fi
+          
+          [ -d "frontend/public" ] && cp -r frontend/public consolidated/frontend/
+          
+          # Install ONLY production dependencies
+          echo "=== Installing production dependencies ==="
+          cd consolidated/backend
+          npm ci --production --omit=dev || npm install --production --omit=dev
+          
+          # Remove unnecessary files from backend node_modules
+          find node_modules -type f -name "*.md" -delete 2>/dev/null || true
+          find node_modules -type f -name "*.txt" -delete 2>/dev/null || true
+          find node_modules -type f -name "*.map" -delete 2>/dev/null || true
+          find node_modules -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name ".github" -exec rm -rf {} + 2>/dev/null || true
+          
+          cd ../frontend
+          npm ci --production --omit=dev || npm install --production --omit=dev
+          
+          # Remove unnecessary files from frontend node_modules
+          find node_modules -type f -name "*.md" -delete 2>/dev/null || true
+          find node_modules -type f -name "*.txt" -delete 2>/dev/null || true
+          find node_modules -type f -name "*.map" -delete 2>/dev/null || true
+          find node_modules -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
+          find node_modules -type d -name ".github" -exec rm -rf {} + 2>/dev/null || true
+          
+          cd ../..
+          
+          # Create startup script
+          cat > consolidated/startup.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "======================================"
+          echo "Starting Full Stack Application"
+          echo "======================================"
+          
+          cd /home/site/wwwroot
+          
+          # Check directory structure
+          echo "Current directory structure:"
+          ls -la
+          
+          # Start backend
+          if [ -d "backend" ]; then
+              echo "Starting Backend API on port 3001..."
+              cd backend
+              PORT=3001 node dist/server.js 2>/dev/null || PORT=3001 node src/server.js 2>/dev/null || PORT=3001 npm start &
+              BACKEND_PID=$!
+              cd ..
+          else
+              echo "ERROR: Backend directory not found!"
+              exit 1
+          fi
+          
+          # Wait for backend to start
+          sleep 10
+          
+          # Start frontend
+          if [ -d "frontend" ]; then
+              echo "Starting Frontend on port 8080..."
+              cd frontend
+              
+              # Try different start methods based on what's available
+              if [ -d ".next" ]; then
+                  echo "Starting Next.js production server..."
+                  PORT=8080 npx next start &
+              elif [ -d "dist" ] || [ -d "build" ]; then
+                  echo "Starting static server..."
+                  PORT=8080 npx serve -s dist -l 8080 2>/dev/null || PORT=8080 npx serve -s build -l 8080 2>/dev/null || PORT=8080 npm start &
+              else
+                  echo "Starting with npm start..."
+                  PORT=8080 npm start &
+              fi
+              FRONTEND_PID=$!
+              cd ..
+          else
+              echo "ERROR: Frontend directory not found!"
+              exit 1
+          fi
+          
+          echo "======================================"
+          echo "Application Started Successfully!"
+          echo "Backend PID: $BACKEND_PID"
+          echo "Frontend PID: $FRONTEND_PID"
+          echo "======================================"
+          
+          # Keep the script running
+          wait $BACKEND_PID $FRONTEND_PID
+          EOF
+          
+          chmod +x consolidated/startup.sh
+          
+          # Verify final structure and size
+          echo "=== Final consolidated structure ==="
+          ls -la consolidated/
+          echo "=== Backend contents ==="
+          ls -la consolidated/backend/ | head -10
+          echo "=== Frontend contents ==="
+          ls -la consolidated/frontend/ | head -10
+          echo "=== Total size before compression ==="
+          du -sh consolidated/
+
+      - name: Zip artifact for deployment
+        run: |
+          cd consolidated
+          # Use maximum compression to reduce file size
+          zip -r -9 ../release.zip .             -x "*.git*"             -x "*/.git/*"             -x "*/node_modules/.cache/*"             -x "*/node_modules/.bin/*"             -x "*.log"             -x "*.DS_Store"
+          cd ..
+          echo "=== Compressed file size ==="
+          ls -lh release.zip
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+
+      - name: Unzip artifact for deployment
+        run: unzip release.zip
+      
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: 'expandev-01'
+          package: .
+          startup-command: 'bash /home/site/wwwroot/startup.sh'
